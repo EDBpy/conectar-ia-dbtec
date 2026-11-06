@@ -1,0 +1,108 @@
+# Configuración del MCP DBHub sobre la réplica dbtec.
+# Las credenciales salen de .env (DBHub lo lee porque mcp_dbhub.bat arranca en esta carpeta).
+# Los límites deben coincidir con [mcp] de config.toml.
+# search_path empieza en consulta para que una tabla sin schema dé error en vez de 0 filas
+# en la base equivocada, y para que search_objects busque primero en las vistas.
+
+[[sources]]
+id = "dbtec"
+description = """
+CUÁNDO USAR: solo si la pregunta necesita datos reales de los sistemas del Grupo EDB, constructora vial de
+Paraguay (obras, máquinas, stock, combustible, fleteros, báscula, facturas, proveedores, certificados).
+Para redactar textos, explicar conceptos o hacer cálculos generales, no usar esta base.
+
+CÓMO EMPEZAR: llamar primero a guia_datos con las palabras de la pregunta. Indica la vista, un ejemplo y los
+cuidados del tema. Las vistas del schema consulta ya unen las tres empresas (columna empresa) y resuelven
+nombres y unidades: preferirlas a las tablas. Con search_objects, buscarlas con object_type = view.
+Si un tema no aparece, buscar tablas indicando el schema: bdedb (EDB), bdcasa (CASA) o bdconsdelpacifico
+(Consorcio). Tienen casi las mismas tablas, pero muchas están vacías en alguna base: 0 filas en una base no
+significa que el dato no exista.
+
+AL RESPONDER: decir de qué fuente sale el número y qué se excluyó. Si se usa un atajo que puede diferir del
+reporte oficial, avisar. Si piden algo que no se puede ver (ej. pagos reales o asientos de EDB y CASA, o sueldos y datos de personal), decirlo desde el principio.
+Montos en guaraníes salvo que tc > 1. Los datos llegan hasta la última carga: ver estado_replica.
+NÚMEROS: la base usa punto decimal (7.500 = siete y medio). Al responder usar coma decimal y punto de miles,
+con la unidad: "7 toneladas", "7,5 toneladas", "1.500 litros". Nunca copiar "7.000" para decir 7.
+"""
+type = "postgres"
+host = "${PG_HOST}"
+port = 5432
+database = "${PG_DB}"
+user = "${MCP_USER}"
+password = "${MCP_PASSWORD}"
+sslmode = "disable"
+search_path = "consulta,control"
+query_timeout = 90
+connection_timeout = 10
+
+[[tools]]
+name = "execute_sql"
+source = "dbtec"
+readonly = true
+max_rows = 1500
+
+[[tools]]
+name = "search_objects"
+source = "dbtec"
+
+[[tools]]
+name = "guia_datos"
+source = "dbtec"
+description = """
+Mapa del negocio a los datos: dada una pregunta, devuelve qué vista o tabla usar, una consulta de ejemplo y
+los cuidados de ese tema. Llamarla primero, antes de buscar tablas o escribir SQL. Si no reconoce la pregunta,
+devuelve la lista de temas disponibles.
+"""
+statement = """
+WITH entrada AS (
+    SELECT to_tsquery('spanish', replace(
+               plainto_tsquery('spanish', translate(lower($1::text), 'áéíóúü', 'aeiouu'))::text,
+               ' & ', ' | ')) AS q
+),
+coincide AS (
+    SELECT t.tema, t.usar, t.ejemplo, t.cuidado, ts_rank(t.busqueda, e.q) AS puntaje
+    FROM control.temas t, entrada e
+    WHERE t.busqueda @@ e.q
+    ORDER BY puntaje DESC
+    LIMIT 2
+)
+SELECT tema, usar, ejemplo, cuidado FROM coincide
+UNION ALL
+SELECT tema, usar, NULL, NULL FROM control.temas WHERE NOT EXISTS (SELECT 1 FROM coincide)
+"""
+
+[[tools.parameters]]
+name = "pregunta"
+type = "string"
+description = "La pregunta del usuario o sus palabras clave, por ejemplo 'horas retroexcavadoras avelino'"
+
+[[tools]]
+name = "estado_replica"
+source = "dbtec"
+description = """
+Hasta cuándo llegan los datos: por cada base, la última carga completa con su fecha, días de antigüedad,
+tablas copiadas, sin permiso o con error. Ignora las pruebas parciales. Usar para saber si los datos están al día.
+"""
+statement = """
+WITH cargas AS (
+    SELECT base, ejecucion_id, max(fin) AS fin,
+           count(*) FILTER (WHERE estado = 'ok') AS tablas_ok,
+           count(*) FILTER (WHERE estado = 'sin_permiso') AS tablas_sin_permiso,
+           count(*) FILTER (WHERE estado = 'error') AS tablas_con_error,
+           sum(filas_destino) AS filas,
+           count(*) AS tablas
+    FROM control.replica_log
+    WHERE tabla IS NOT NULL
+    GROUP BY base, ejecucion_id
+),
+completas AS (
+    SELECT c.*, max(c.tablas) OVER (PARTITION BY c.base) AS maximo FROM cargas c
+)
+SELECT DISTINCT ON (base)
+       base, fin AS ultima_carga_completa,
+       (current_date - fin::date) AS dias_de_antiguedad,
+       tablas_ok, tablas_sin_permiso, tablas_con_error, filas
+FROM completas
+WHERE tablas >= maximo * 0.9
+ORDER BY base, fin DESC
+"""
